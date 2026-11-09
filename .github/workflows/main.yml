@@ -1,0 +1,119 @@
+name: Continuous Windows RDP via Tailscale
+
+on:
+  workflow_dispatch:
+  # Optional: Uncomment below if you want it to also trigger on a schedule or chain automatically
+  # schedule:
+  #   - cron: '0 */5 * * *'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    # Set to 300 minutes (5 hours) to safely trigger a restart before the 360-minute hard limit
+    timeout-minutes: 300
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+         
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+         
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+         
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Setup Startup Downloads Script
+        run: |
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "Downloads.bat copied successfully."
+                      cmd /c $downloadPath
+                      break
+                  }
+                  catch {
+                      Write-Host "Error executing Downloads.bat: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+      - name: Display Connection Details & Run Timer
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "==================`n"
+
+          # Run for 4 hours and 45 minutes (285 minutes), leaving a 15-minute buffer to safely trigger the next job
+          $targetMinutes = 285
+          Write-Host "RDP instance will stay active for $targetMinutes minutes before auto-retriggering a new runner."
+          Start-Sleep -Seconds ($targetMinutes * 60)
+
+      - name: Auto-Trigger Next Workflow Run
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: context.payload.workflow.file_name || 'rdp-loop.yml',
+                ref: context.ref
+              });
+              console.log("Successfully triggered the next RDP workflow run!");
+            } catch (error) {
+              console.error("Failed to trigger next workflow run:", error);
+            }
