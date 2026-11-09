@@ -2,9 +2,6 @@ name: Continuous Windows RDP via Tailscale
 
 on:
   workflow_dispatch:
-  # Optional: Uncomment below if you want it to also trigger on a schedule or chain automatically
-  # schedule:
-  #   - cron: '0 */5 * * *'
 
 jobs:
   secure-rdp:
@@ -68,25 +65,17 @@ jobs:
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
           $downloadPath = "$startupPath\Downloads.bat"
 
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "Downloads.bat copied successfully."
-                      cmd /c $downloadPath
-                      break
-                  }
-                  catch {
-                      Write-Host "Error executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
-              }
-              else {
-                  Start-Sleep -Seconds 30
-              }
+          # Force create the startup path directory structure immediately without hanging
+          if (-not (Test-Path $startupPath)) {
+              New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+          }
+
+          try {
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+              Write-Host "Downloads.bat copied successfully to startup folder."
+          }
+          catch {
+              Write-Host "Error downloading Downloads.bat: $($_.Exception.Message)"
           }
 
       - name: Display Connection Details & Run Timer
@@ -96,7 +85,7 @@ jobs:
           Write-Host "Username: RDP"
           Write-Host "==================`n"
 
-          # Run for 4 hours and 45 minutes (285 minutes), leaving a 15-minute buffer to safely trigger the next job
+          # Run for 4 hours and 45 minutes (285 minutes), leaving a buffer to trigger the next job
           $targetMinutes = 285
           Write-Host "RDP instance will stay active for $targetMinutes minutes before auto-retriggering a new runner."
           Start-Sleep -Seconds ($targetMinutes * 60)
